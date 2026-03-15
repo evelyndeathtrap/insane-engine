@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8">
+    <title>3D Scene</title>
+    <style>
+     body {
+  margin: 0;
+  font-family: sans-serif;
+  cursor: default;
+  text-align: center;
+  background: #000;
+  overflow: hidden;
+  width: 100vw;
+  height: 100vh;
+}
+canvas { 
+  width: 100vw; 
+  height: 100vh;
+  display: block;
+}
+#loading {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  color: white;
+  background: rgba(0,0,0,0.7);
+  padding: 20px;
+  border-radius: 10px;
+  z-index: 1000;
+}
+#debug {
+  position: fixed;
+  top: 10px;
+  left: 10px;
+  color: white;
+  background: rgba(0,0,0,0.7);
+  padding: 10px;
+  border-radius: 5px;
+  font-size: 12px;
+  z-index: 1000;
+}
+    </style>
+  </head>
+  <body>
+    <div id="loading">Loading scene...</div>
+    <div id="debug" style="display: none;"></div>
+
+    <script type="module">
+      var THREE = require("three");
+      var { GLTFLoader } = require("./js/GLTFLoader.js");
+      var { ConvexHull } = require("./js/ConvexHull.js");
+      var ammo = require("./js/ammo.wasm.js");
+      const loader = new GLTFLoader();
+      let clock = new THREE.Clock();
+
+      let camera;
+      var mainscene = new THREE.Scene();
+      mainscene.background = new THREE.Color(0x87CEEB);
+
+      let physicsWorld;
+
+      var renderer = new THREE.WebGLRenderer({antialias:false});
+      renderer.setClearColor("#000000");
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.physicallyCorrectLights = true;
+      
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      renderer.shadowMap.autoUpdate = true;
+      document.body.appendChild(renderer.domElement);
+
+      var rigidBodies = [];    
+
+      function updateDebugInfo() {
+        const debug = document.getElementById('debug');
+        if (camera) {
+          debug.innerHTML = 'Debug mode';
+        } else {
+          debug.innerHTML = 'No camera found - using fallback';
+        }
+      }
+
+      ammo().then((Ammo) => {
+      
+      function parseModel(sc, animations) {
+        console.log("Parsing model with animations:", animations ? animations.map(a => a.name) : 'none');
+        
+        sc.traverse(obj => {
+          console.log("Object:", obj.name, "Type:", obj.type, "UserData:", obj.userData);
+          obj.receiveShadow = true;
+          if (!obj.userData.castShadow === false ) 
+	          obj.castShadow = true;
+          
+          if (obj instanceof THREE.PointLight) {
+            obj.castShadow = true;
+            obj.shadow.mapSize.width = 1024;
+            obj.shadow.mapSize.height = 1024;
+            obj.shadow.camera.near = 0.5;
+            obj.shadow.camera.far = 50;
+            obj.shadow.bias = -0.001;
+            obj.shadow.normalBias = 0.02;
+            console.log(obj);
+          } 
+          
+          if (obj.userData.script) {
+            console.log("Found script:", obj.userData.script);
+            try {
+              var script = require("./"+obj.userData.script);
+              
+              obj.init = script.init;
+              obj.update = script.update;
+              obj.renderer = renderer;
+              obj.camera = camera;
+              obj.ammo = Ammo;
+
+              if (animations && animations.length > 0) {
+                obj.mixer = new THREE.AnimationMixer(obj);
+                obj.animations = {};
+                
+                animations.forEach(anim => {
+                  obj.animations[anim.name] = obj.mixer.clipAction(anim);
+                  console.log("Added animation:", anim.name, "to object:", obj.name);
+                });
+                
+                if (obj.animations.idle) {
+                  obj.animations.idle.play();
+                  console.log("Playing idle animation on", obj.name);
+                }
+              }
+
+              if (obj.init) {
+                obj.init.call(obj);
+              }
+            } catch (error) {
+              console.error("Error loading script:", error);
+            }
+          }
+          
+          if (obj.userData.physics) {
+            var pos = obj.position;
+            var quat = obj.quaternion;
+            
+            var worldScale = new THREE.Vector3();
+            obj.updateWorldMatrix(true, false);
+            obj.getWorldScale(worldScale);
+            
+            console.log("=== PHYSICS DEBUG ===");
+            console.log("Object name:", obj.name);
+            console.log("Local position:", pos);
+            console.log("Local scale:", obj.scale); 
+            console.log("World scale:", worldScale);
+            console.log("Mass:", obj.userData.mass || 0);
+            console.log("Shape:", obj.userData.physics_shape);
+
+            let transform = new Ammo.btTransform();
+            transform.setIdentity();
+            
+            let worldPos = new THREE.Vector3();
+            obj.getWorldPosition(worldPos);
+            
+            console.log("World position:", worldPos);
+            
+            transform.setOrigin(new Ammo.btVector3(worldPos.x, worldPos.y, worldPos.z));
+            transform.setRotation(new Ammo.btQuaternion(quat.x, quat.y, quat.z, quat.w));
+
+            let shape;
+            const mass = obj.userData.mass || 0;
+
+            // BOX SHAPE
+            if (obj.userData["physics shape"] === 'box' || !obj.userData["physics shape"] ) {
+                const halfExtents = new Ammo.btVector3(
+                    worldScale.x * 0.5,
+                    worldScale.y * 0.5,
+                    worldScale.z * 0.5
+                );
+                shape = new Ammo.btBoxShape(halfExtents);
+                console.log("Box half extents:", halfExtents.x(), halfExtents.y(), halfExtents.z());
+            }
+            // SPHERE SHAPE
+            else if (obj.userData["physics shape"]  === 'sphere') {
+                const radius = Math.max(worldScale.x, worldScale.y, worldScale.z) * 0.5;
+                shape = new Ammo.btSphereShape(radius);
+                console.log("Sphere radius:", radius);
+            }
+            // CYLINDER SHAPE
+            else if (obj.userData["physics shape"]  === 'cylinder') {
+                const halfExtents = new Ammo.btVector3(
+                    worldScale.x * 0.5,
+                    worldScale.y * 0.5,
+                    worldScale.z * 0.5 
+                );
+                shape = new Ammo.btCylinderShape(halfExtents);
+                console.log("Cylinder half extents:", halfExtents.x(), halfExtents.y(), halfExtents.z());
+            }
+            // TRIANGLE MESH SHAPE
+            else if (obj.userData["physics shape"]  === 'trimesh') {
+                console.log("Creating triangle mesh shape...");
+                
+                let triangle_mesh = new Ammo.btTriangleMesh();
+                let verticesPos = obj.geometry.getAttribute('position').array;
+                let indices = obj.geometry.index ? obj.geometry.index.array : null;
+                
+                if (indices) {
+                    console.log("Using indexed geometry with", indices.length, "indices");
+                    for (let i = 0; i < indices.length; i += 3) {
+                        let i0 = indices[i] * 3;
+                        let i1 = indices[i + 1] * 3;
+                        let i2 = indices[i + 2] * 3;
+                        
+                        let vectA = new Ammo.btVector3(
+                            verticesPos[i0] * worldScale.x,
+                            verticesPos[i0 + 1] * worldScale.y,
+                            verticesPos[i0 + 2] * worldScale.z
+                        );
+                        
+                        let vectB = new Ammo.btVector3(
+                            verticesPos[i1] * worldScale.x,
+                            verticesPos[i1 + 1] * worldScale.y,
+                            verticesPos[i1 + 2] * worldScale.z
+                        );
+                        
+                        let vectC = new Ammo.btVector3(
+                            verticesPos[i2] * worldScale.x,
+                            verticesPos[i2 + 1] * worldScale.y,
+                            verticesPos[i2 + 2] * worldScale.z
+                        );
+                        
+                        triangle_mesh.addTriangle(vectA, vectB, vectC, true);
+                        
+                        Ammo.destroy(vectA);
+                        Ammo.destroy(vectB);
+                        Ammo.destroy(vectC);
+                    }
+                } else {
+                    console.log("Using non-indexed geometry with", verticesPos.length, "vertices");
+                    for (let i = 0; i < verticesPos.length; i += 9) {
+                        let vectA = new Ammo.btVector3(
+                            verticesPos[i] * worldScale.x,
+                            verticesPos[i + 1] * worldScale.y,
+                            verticesPos[i + 2] * worldScale.z
+                        );
+                        
+                        let vectB = new Ammo.btVector3(
+                            verticesPos[i + 3] * worldScale.x,
+                            verticesPos[i + 4] * worldScale.y,
+                            verticesPos[i + 5] * worldScale.z
+                        );
+                        
+                        let vectC = new Ammo.btVector3(
+                            verticesPos[i + 6] * worldScale.x,
+                            verticesPos[i + 7] * worldScale.y,
+                            verticesPos[i + 8] * worldScale.z
+                        );
+                        
+                        triangle_mesh.addTriangle(vectA, vectB, vectC, true);
+                        
+                        Ammo.destroy(vectA);
+                        Ammo.destroy(vectB);
+                        Ammo.destroy(vectC);
+                    }
+                }
+                
+                shape = new Ammo.btBvhTriangleMeshShape(triangle_mesh, true, true);
+                console.log("Triangle mesh shape created with", verticesPos.length / 3, "triangles");
+            }
+            // CONVEX HULL SHAPE
+            else if (obj.userData.physics_convex) {
+                console.log("Creating convex shape with scale...");
+                
+                shape = new Ammo.btConvexHullShape();
+                let verticesPos = obj.geometry.getAttribute('position').array;
+                
+                for (let i = 0; i < verticesPos.length; i += 3) {
+                    let vertex = new Ammo.btVector3(
+                        verticesPos[i] * worldScale.x,
+                        verticesPos[i + 1] * worldScale.y,
+                        verticesPos[i + 2] * worldScale.z
+                    );
+                    shape.addPoint(vertex, true);
+                    Ammo.destroy(vertex);
+                }
+                
+                console.log("Convex hull shape created with", verticesPos.length / 3, "vertices");
+            }
+
+            if (shape) {
+                shape.setMargin(0.05);
+                
+                const motionState = new Ammo.btDefaultMotionState(transform);
+                const localInertia = new Ammo.btVector3(0, 0, 0);
+                
+                const effectiveMass = (obj.userData.physics_shape === 'trimesh') ? 0 : mass;
+                
+                if (effectiveMass > 0) {
+                    shape.calculateLocalInertia(effectiveMass, localInertia);
+                    console.log("Local inertia calculated:", localInertia.y());
+                } else {
+                    console.log("Static object - no inertia");
+                }
+                
+                const rbInfo = new Ammo.btRigidBodyConstructionInfo(effectiveMass, motionState, shape, localInertia);
+                const body = new Ammo.btRigidBody(rbInfo);
+                
+                if (effectiveMass > 0) {
+                    body.setFriction(0.5);
+                    body.setRestitution(0.1);
+                    body.setDamping(0.05, 0.05);
+                } else {
+                    body.setCollisionFlags(body.getCollisionFlags() | Ammo.btCollisionObject.CF_STATIC_OBJECT);
+                }
+                
+                physicsWorld.addRigidBody(body);
+                obj.physicsBody = body;
+                rigidBodies.push(obj);
+            }
+          }
+        });
+      }
+
+      function setupPhysicsWorld(){
+          console.log("Setting up physics world...");
+          
+          let collisionConfiguration = new Ammo.btDefaultCollisionConfiguration();
+          let dispatcher = new Ammo.btCollisionDispatcher(collisionConfiguration);
+          let overlappingPairCache = new Ammo.btDbvtBroadphase();
+          let solver = new Ammo.btSequentialImpulseConstraintSolver();
+
+          physicsWorld = new Ammo.btDiscreteDynamicsWorld(dispatcher, overlappingPairCache, solver, collisionConfiguration);
+          
+          physicsWorld.setGravity(new Ammo.btVector3(0, -9.8, 0));
+          
+          physicsWorld.getDispatchInfo().set_m_allowedCcdPenetration(0.0001);
+          physicsWorld.getSolverInfo().m_splitImpulse = 1;
+          physicsWorld.getSolverInfo().m_splitImpulsePenetrationThreshold = -0.002;
+          
+          console.log("Physics world configured with CCD");
+      }
+
+      setupPhysicsWorld();
+      
+      var tmpTrans = new Ammo.btTransform();
+      
+      function updatePhysics(deltaTime){
+          physicsWorld.stepSimulation(deltaTime, 1/60);
+
+          for (let i = 0; i < rigidBodies.length; i++) {
+              let objThree = rigidBodies[i];
+              let objAmmo = objThree.physicsBody;
+              let ms = objAmmo.getMotionState();
+              if (ms) {
+                  ms.getWorldTransform(tmpTrans);
+                  let p = tmpTrans.getOrigin();
+                  let q = tmpTrans.getRotation();
+                  
+                  objThree.position.set(p.x(), p.y(), p.z());
+                  objThree.quaternion.set(q.x(), q.y(), q.z(), q.w());
+              }
+          }
+      }
+
+      async function loadModel(name) {
+          console.log("Loading " + name);
+          return new Promise((resolve, reject) => {
+              loader.load(
+                  name,
+                  async function (gltf) {
+                      console.log("=== GLTF LOAD DEBUG ===");
+                      console.log("GLTF object:", gltf);
+                      console.log("Scene:", gltf.scene);
+                      
+                      var scene = new THREE.Scene();
+                      scene.add(gltf.scene);
+                      scene.animations = gltf.animations;
+
+                      const allCameras = [];
+                      
+                      if (gltf.cameras && gltf.cameras.length > 0) {
+                          console.log("Found cameras in gltf.cameras array:");
+                          gltf.cameras.forEach((cam, index) => {
+                              console.log(`  Camera ${index}:`, cam);
+                              allCameras.push(cam);
+                          });
+                      } else {
+                          console.log("No cameras found in gltf.cameras array");
+                      }
+                      
+                      let objectCount = 0;
+                      gltf.scene.traverse(obj => {
+                          objectCount++;
+                          if (obj.isCamera) {
+                              console.log("  >>> FOUND CAMERA OBJECT IN SCENE!");
+                              allCameras.push(obj);
+                              if (obj.userData.main)
+                                  camera = obj;
+                          }
+                      });
+                      console.log(`Total objects traversed: ${objectCount}`);
+
+                      const modelPromises = [];
+                      gltf.scene.traverse(obj => {
+                          if (obj.userData && obj.userData.model) {
+                              console.log("Found child model reference:", obj.userData.model);
+                              modelPromises.push(
+                                  loadModel(obj.userData.model).then(childModel => {
+                                      obj.model = childModel;
+                                      
+                                      if (childModel.animations && childModel.animations.length > 0) {
+                                          obj.mixer = new THREE.AnimationMixer(childModel);
+                                          obj.animations = {};
+                                          
+                                          childModel.animations.forEach(anim => {
+                                              obj.animations[anim.name] = obj.mixer.clipAction(anim);
+                                          });
+                                          
+                                          if (obj.animations.idle) {
+                                              obj.animations.idle.play();
+                                          }
+                                      }
+                                      var v = THREE.Vector3()
+                                      obj.getWorldPosition(v)
+                                      childModel.position.copy(v)					
+                                      childModel.rotation.copy(obj.rotation)
+                                      obj.add(childModel);
+                                      return obj;
+                                  }).catch(error => {
+                                      console.error("Error loading child model:", error);
+                                  })
+                              );
+                          }
+                      });
+
+                      if (modelPromises.length > 0) {
+                          await Promise.all(modelPromises);
+                      }
+
+                      parseModel(gltf.scene, gltf.animations);
+                      
+                      document.getElementById('loading').style.display = 'none';
+                      document.getElementById('debug').style.display = 'block';
+                      updateDebugInfo();
+                      
+                      resolve(scene);
+                  },
+                  function (xhr) {
+                      const percent = (xhr.loaded / xhr.total * 100).toFixed(1);
+                      document.getElementById('loading').textContent = `Loading: ${percent}%`;
+                      console.log((xhr.loaded / xhr.total * 100) + '% loaded');
+                  },
+                  function (error) {
+                      console.error("Load error:", error);
+                      document.getElementById('loading').textContent = 'Error loading scene';
+                      reject(error);
+                  }
+              );
+          });
+      }
+      
+      // Load main scene
+      loadModel("scene.glb").then(s => { 
+          mainscene.add(s);
+          console.log("Main scene added to renderer");
+      }).catch(error => {
+          console.error("Failed to load main scene:", error);
+      });
+
+      function ensureCamera() {
+          // Camera fallback logic if needed
+      }
+
+      var render = function () {
+          requestAnimationFrame(render);
+          
+          const delta = clock.getDelta();
+          
+          ensureCamera();
+          
+          mainscene.traverse(obj => {
+          
+              if (obj.mixer) {
+                  obj.mixer.update(delta);
+              }
+              if (obj.update) {
+                  obj.update.call(obj, delta);
+              }
+          });
+	  
+          renderer.render(mainscene, camera);
+          updatePhysics(delta);
+          updateDebugInfo();
+      };
+
+      render();
+
+      let resizeTimeout;
+      window.addEventListener('resize', function() {
+          clearTimeout(resizeTimeout);
+          resizeTimeout = setTimeout(() => {
+              console.log("=== RESIZE HANDLER ===");
+              
+              const width = window.innerWidth;
+              const height = window.innerHeight;
+              
+              renderer.setSize(width, height);
+              
+              if (camera) {
+                  if (camera.isPerspectiveCamera) {
+                      camera.aspect = width / height;
+                      camera.updateProjectionMatrix();
+                  }
+                  renderer.render(mainscene, camera);
+              }
+              
+              console.log("Resize completed:", width, "x", height);
+          }, 100);
+      });
+      });
+    </script>
+  </body>
+</html>
